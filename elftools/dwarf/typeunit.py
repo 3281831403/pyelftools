@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from functools import cached_property
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any
 
 from ..common.utils import dwarf_assert
 from .die import DIE
@@ -35,7 +35,9 @@ class TypeUnit:
             Type units are stored in the .debug_types section. This section was
             introduced by the DWARFv4 standard (and removed in the DWARFv5 standard;
             the underlying type units were relocated to the .debug_info
-            section - DWARFv5 section 1.4)
+            section - DWARFv5 section 1.4). A TypeUnit created for a DWARFv5
+            type unit therefore reads from .debug_info, which is what the
+            `stream` argument selects.
 
         Serves as a container and context to DIEs that describe type definitions
         referenced from compilation units and other type units.
@@ -54,6 +56,7 @@ class TypeUnit:
         structs: DWARFStructs,
         tu_offset: int,
         tu_die_offset: int,
+        stream: IO[bytes] | None = None,
     ) -> None:
         """ header:
                 TU header for this type unit
@@ -69,12 +72,22 @@ class TypeUnit:
 
             tu_die_offset:
                 Offset in the stream of the top DIE of this TU
+
+            stream:
+                The stream containing this TU. Defaults to the .debug_types
+                section stream; DWARFv5 type units, which live in .debug_info,
+                pass that section's stream instead.
         """
         self.dwarfinfo = dwarfinfo
         self.header = header
         self.structs = structs
         self.tu_offset = tu_offset
         self.tu_die_offset = tu_die_offset
+        if stream is None:
+            # DWARFv4 type units: the default storage is .debug_types.
+            assert dwarfinfo.debug_types_sec is not None
+            stream = dwarfinfo.debug_types_sec.stream
+        self.stream = stream
 
         # A list of DIEs belonging to this TU.
         # This list is lazily constructed as DIEs are iterated over.
@@ -122,10 +135,9 @@ class TypeUnit:
         if self._diemap:
             return self._dielist[0]
 
-        assert self.dwarfinfo.debug_types_sec is not None
         top = DIE(
                 cu=self,
-                stream=self.dwarfinfo.debug_types_sec.stream,
+                stream=self.stream,
                 offset=self.tu_die_offset)
 
         self._dielist.insert(0, top)
