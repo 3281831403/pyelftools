@@ -16,7 +16,7 @@ from functools import cached_property
 from io import BytesIO
 from typing import IO, TYPE_CHECKING, Any
 
-from ..common.exceptions import ELFError, ELFParseError
+from ..common.exceptions import ELFCompressionError, ELFError, ELFParseError
 from ..common.utils import elf_assert, struct_parse
 from ..dwarf.dwarf_util import _file_crc32
 from ..dwarf.dwarfinfo import DebugSectionDescriptor, DwarfConfig, DWARFInfo
@@ -945,33 +945,75 @@ class ELFFile:
     @staticmethod
     def _decompress_dwarf_section(section: DebugSectionDescriptor) -> DebugSectionDescriptor:
         """ Returns the uncompressed contents of the provided DWARF section.
-        """
-        # TODO: support other compression formats from readelf.c
-        assert section.size > 12, 'Unsupported compression format.'
 
+        Only the GNU .zdebug format is supported: a "ZLIB" magic, the
+        uncompressed size as an 8-byte big-endian integer and a zlib stream.
+        The declared uncompressed size is treated as a hard limit, so a
+        malformed section can never be expanded beyond it. Every failure is
+        reported as ELFCompressionError (which, unlike AssertionError, is
+        unaffected by -O / PYTHONOPTIMIZE).
+        """
         section.stream.seek(0)
         # According to readelf.c the content should contain "ZLIB"
         # followed by the uncompressed section size - 8 bytes in
         # big-endian order
+        if section.size < 12:
+            raise ELFCompressionError(
+                f'Compressed section {section.name!r} is too small for its header')
+
         compression_type = section.stream.read(4)
-        assert compression_type == b'ZLIB', \
-            f'Invalid compression type: {compression_type!r}'
+        if compression_type != b'ZLIB':
+            raise ELFCompressionError(
+                f'Invalid compression type: {compression_type!r}')
 
         uncompressed_size = struct.unpack('>Q', section.stream.read(8))[0]
 
         decompressor = zlib.decompressobj()
         uncompressed_stream = BytesIO()
-        while True:
-            chunk = section.stream.read(4096)
-            if not chunk:
-                break
-            uncompressed_stream.write(decompressor.decompress(chunk))
-        uncompressed_stream.write(decompressor.flush())
+        try:
+            # Phase 1: feed the section stream to zlib in fixed chunks,
+            # bounding every call to the remaining declared size so the
+            # decompressed output can never grow past it (including the
+            # declared-size-zero case). If the cap blocks zlib, unconsumed
+            # input parks in unconsumed_tail: the stream yields more than
+            # the header declared, which is an error rather than something
+            # to silently truncate.
+            overshot = False
+            while not decompressor.eof:
+                chunk = section.stream.read(4096)
+                if not chunk:
+                    break
+                uncompressed_stream.write(
+                    decompressor.decompress(
+                        chunk,
+                        uncompressed_size - uncompressed_stream.tell()))
+                if decompressor.unconsumed_tail:
+                    overshot = True
+                    break
+                if uncompressed_stream.tell() >= uncompressed_size:
+                    break
 
-        uncompressed_stream.seek(0, io.SEEK_END)
+            # Phase 2: only reached when the output never exceeded the cap.
+            # Feed whatever section data remains (small reads, zero output
+            # budget) so a complete stream can reach its end-of-stream
+            # marker. unconsumed_tail is deliberately never re-fed here:
+            # doing so with a zero budget makes zlib buffer the whole section.
+            if not overshot:
+                while not decompressor.eof:
+                    chunk = section.stream.read(4096)
+                    if not chunk:
+                        break
+                    decompressor.decompress(chunk, 0)
+                decompressor.flush()
+        except zlib.error as exc:
+            raise ELFCompressionError(
+                f'Error while decompressing section {section.name!r}: {exc}') from exc
+
         size = uncompressed_stream.tell()
-        assert uncompressed_size == size, \
-                f'Wrong uncompressed size: expected {uncompressed_size!r}, but got {size!r}'
+        if overshot or not decompressor.eof or size != uncompressed_size:
+            raise ELFCompressionError(
+                f'Wrong uncompressed size for section {section.name!r}: '
+                f'expected {uncompressed_size}, but got {size}')
 
         return section._replace(stream=uncompressed_stream, size=size)
 

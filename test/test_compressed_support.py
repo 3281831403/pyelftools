@@ -6,13 +6,17 @@
 #-------------------------------------------------------------------------------
 
 import os
+import struct
 import unittest
+import zlib
 from contextlib import contextmanager
+from io import BytesIO
 
 from elftools.common.exceptions import ELFCompressionError
 from elftools.elf.constants import SH_FLAGS
 from elftools.elf.descriptions import describe_sh_flags
 from elftools.elf.elffile import ELFFile
+from elftools.dwarf.dwarfinfo import DebugSectionDescriptor
 
 
 class TestCompressedSupport(unittest.TestCase):
@@ -96,3 +100,81 @@ class TestCompressedSupport(unittest.TestCase):
             result.append(f'CU {cu.cu_offset:#0x}: {dies[0]:#0x}-{dies[-1]:#0x}')
 
         return result
+
+
+class TestGNUZDebugDecompression(unittest.TestCase):
+    """ Malformed GNU .zdebug sections must raise ELFCompressionError rather
+        than AssertionError (which -O strips) or raw zlib errors, and must
+        never expand past the declared uncompressed size.
+    """
+    def descriptor(self, payload):
+        return DebugSectionDescriptor(
+            stream=BytesIO(payload), name='.zdebug_info',
+            global_offset=0, size=len(payload), address=0)
+
+    def zdebug(self, declared_size, compressed_payload, magic=b'ZLIB'):
+        return magic + struct.pack('>Q', declared_size) + compressed_payload
+
+    def test_bad_magic(self):
+        payload = self.zdebug(4, zlib.compress(b'data'), magic=b'XYZB')
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))
+
+    def test_header_too_small(self):
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(b'ZLIB\x00'))
+
+    def test_declared_size_mismatch(self):
+        payload = self.zdebug(99, zlib.compress(b'data'))
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))
+
+    def test_truncated_zlib_stream(self):
+        full = zlib.compress(b'A' * 1000)
+        payload = self.zdebug(1000, full[:len(full) // 2])
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))
+
+    def test_truncated_stream_at_declared_size(self):
+        # The truncated stream still produces exactly the declared number of
+        # bytes: it must be rejected instead of silently accepted.
+        full = zlib.compress(b'A' * 100)
+        payload = self.zdebug(100, full[:-3])
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))
+
+    def test_garbage_payload(self):
+        payload = self.zdebug(4, b'not-a-zlib-stream')
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))
+
+    def test_oversize_stream_capped_and_rejected(self):
+        # The header claims 100 bytes but the stream expands to 50 KiB.
+        inflated = b'B' * (50 * 1024)
+        payload = self.zdebug(100, zlib.compress(inflated))
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))
+
+    def test_valid_roundtrip(self):
+        data = b'hello compressed section' * 64
+        payload = self.zdebug(len(data), zlib.compress(data))
+        result = ELFFile._decompress_dwarf_section(
+            self.descriptor(payload))
+        result.stream.seek(0)
+        self.assertEqual(result.stream.read(), data)
+        self.assertEqual(result.size, len(data))
+
+    def test_valid_empty_section(self):
+        payload = self.zdebug(0, zlib.compress(b''))
+        result = ELFFile._decompress_dwarf_section(
+            self.descriptor(payload))
+        self.assertEqual(result.size, 0)
+        result.stream.seek(0)
+        self.assertEqual(result.stream.read(), b'')
+
+    def test_zero_declared_size_with_data_rejected(self):
+        # The loop must still feed zlib when the declared size is zero,
+        # instead of skipping decompression and accepting the section.
+        payload = self.zdebug(0, zlib.compress(b'x'))
+        with self.assertRaises(ELFCompressionError):
+            ELFFile._decompress_dwarf_section(self.descriptor(payload))

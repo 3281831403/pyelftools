@@ -133,6 +133,64 @@ class TestDataBounds(unittest.TestCase):
                     with self.assertRaises(ELFParseError):
                         section.data()
 
+    def _compressed_section(self, declared_size, payload, structs=None):
+        structs = structs or self.structs()
+        header = structs.Elf_Chdr.build(Container(
+            ch_type='ELFCOMPRESS_ZLIB', ch_reserved=0,
+            ch_size=declared_size, ch_addralign=1))
+        stored = header + payload
+        return self.section(BytesIO(stored), 0, len(stored),
+                            compressed=True, structs=structs)
+
+    def test_compressed_garbage_raises_library_exception(self):
+        section = self._compressed_section(4, b'not-a-zlib-stream')
+        with self.assertRaises(ELFCompressionError):
+            section.data()
+
+    def test_compressed_oversize_not_silently_truncated(self):
+        # Header says 50 bytes, the stream actually yields 100: the old code
+        # returned the first 50 bytes without any error.
+        section = self._compressed_section(50, zlib.compress(b'A' * 100))
+        with self.assertRaises(ELFCompressionError):
+            section.data()
+
+    def test_compressed_truncated_stream_rejected(self):
+        section = self._compressed_section(
+            10, zlib.compress(b'C' * 1000)[:10])
+        with self.assertRaises(ELFCompressionError):
+            section.data()
+
+    def test_compressed_truncated_at_declared_size_rejected(self):
+        # A truncated stream can still emit exactly the declared number of
+        # bytes; this must not be treated as a success.
+        section = self._compressed_section(
+            10, zlib.compress(b'D' * 10)[:-2])
+        with self.assertRaises(ELFCompressionError):
+            section.data()
+
+    def test_compressed_roundtrip_never_exceeds_declared_size(self):
+        data = b'E' * 4096
+        section = self._compressed_section(len(data), zlib.compress(data))
+        self.assertEqual(section.data(), data)
+
+    def test_compressed_decompression_bomb_capped(self):
+        # A 30 KiB section claims 64 bytes; decompression must never grow past
+        # that cap while detecting the mismatch.
+        bomb = zlib.compress(b'F' * (30 * 1024))
+        section = self._compressed_section(64, bomb)
+        with self.assertRaises(ELFCompressionError):
+            section.data()
+
+    def test_compressed_zero_declared_size(self):
+        # A genuine empty stream with a declared size of zero round-trips;
+        # a stream that actually yields data must be rejected rather than
+        # silently dropping it.
+        section = self._compressed_section(0, zlib.compress(b''))
+        self.assertEqual(section.data(), b'')
+        section = self._compressed_section(0, zlib.compress(b'x'))
+        with self.assertRaises(ELFCompressionError):
+            section.data()
+
 
 if __name__ == '__main__':
     unittest.main()

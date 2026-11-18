@@ -116,8 +116,43 @@ class Section:
                 compressed = stream_read(
                     self.stream, self['sh_offset'] + hdr_size, self['sh_size'] - hdr_size)
 
+                # The declared decompressed size is a hard limit: cap the
+                # output so a malformed section cannot be expanded beyond it.
                 decomp = zlib.decompressobj()
-                result = decomp.decompress(compressed, self.data_size)
+                try:
+                    result = decomp.decompress(compressed, self.data_size)
+                except zlib.error as exc:
+                    raise ELFCompressionError(
+                        f'Error while decompressing section {self.name!r}: {exc}'
+                    ) from exc
+
+                # The state right after the bounded decompression is enough
+                # to tell every malformed case apart, and avoids draining the
+                # rest of the stream (which could make zlib buffer an amount
+                # of data proportional to the whole, possibly huge, section):
+                #  * unconsumed_tail non-empty means the output cap blocked
+                #    zlib: the stream yields more than the header declared,
+                #    so returning the capped output would silently truncate;
+                #  * eof unset with an empty tail means the input ended
+                #    before the stream's end-of-stream marker: a truncated
+                #    stream, even one that produced exactly the declared
+                #    number of bytes;
+                #  * a short output with eof set is a plain size mismatch.
+                if decomp.unconsumed_tail:
+                    raise ELFCompressionError(
+                        f'Decompressed data is longer than the declared '
+                        f'{self._decompressed_size} bytes for section {self.name!r}'
+                    )
+                if not decomp.eof:
+                    raise ELFCompressionError(
+                        f'Decompressed stream for section {self.name!r} is truncated: '
+                        f'got {len(result)} of {self._decompressed_size} bytes'
+                    )
+                if len(result) != self._decompressed_size:
+                    raise ELFCompressionError(
+                        f'Decompressed data is {len(result)} bytes long, should be {self._decompressed_size} bytes'
+                        ' long'
+                    )
             elif isinstance(c_type, int):
                 raise ELFCompressionError(
                     f'Unknown compression type: {c_type:#0x}'
@@ -125,12 +160,6 @@ class Section:
             else:
                 raise ELFCompressionError(
                     f'Unknown compression type: {c_type!r}'
-                )
-
-            if len(result) != self._decompressed_size:
-                raise ELFCompressionError(
-                    f'Decompressed data is {len(result)} bytes long, should be {self._decompressed_size} bytes'
-                    ' long'
                 )
         else:
             result = stream_read(self.stream, self['sh_offset'], self._decompressed_size)
